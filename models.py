@@ -134,6 +134,34 @@ class QPolicy(nn.Module):
         return self.dist_class(probs, **self.kwargs)
 
 
+class VPolicy(nn.Module):
+    def __init__(self, vf, actions, dist_class, **kwargs):
+        super().__init__()
+        self.vf = vf
+        self.actions = torch.arange(actions)
+        self.num_actions = actions
+        self.dist_class = dist_class
+        self.kwargs = kwargs
+
+    def parameters(self, recurse=True):
+        return self.qf.parameters(recurse)
+
+    def forward(self, states):
+        """
+        :param states: lookahead in N, Action, State
+        :return: Probability distribution over actions
+        """
+        b = states.size(0)
+        a = states.size(1)
+        obs_shape = states.shape[2:]
+        states = states.view(b * a, *obs_shape)
+        values = self.vf(states)
+        values = values.view(b, a)
+        probs = torch.softmax(values, dim=1)
+
+        return self.dist_class(probs, **self.kwargs)
+
+
 def gradnorm(model):
     total_norm = 0
     for p in model.parameters():
@@ -141,6 +169,18 @@ def gradnorm(model):
         total_norm += param_norm.item() ** 2
     total_norm = total_norm ** (1. / 2)
     return total_norm
+
+
+class DiscreteVTable(nn.Module):
+    def __init__(self, features):
+        super().__init__()
+        self.weights = nn.Parameter(torch.rand(*features))
+        self.features = features
+        self.feature_dims = list(range(1, len(features) + 1))
+
+    def forward(self, state):
+        activations = state * self.weights
+        return torch.sum(activations, dim=self.feature_dims)
 
 
 class DiscreteQTable(nn.Module):

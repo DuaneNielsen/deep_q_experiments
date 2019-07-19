@@ -1,6 +1,10 @@
 from data import *
 import numpy as np
 import torch
+from torch import tensor
+import gym
+import gym_duane
+
 
 def test_SARSGridDataset():
     state = np.array([
@@ -68,58 +72,55 @@ def test_SARSGridDataset():
 
 def test_expbuffer():
 
-    eb = ExpBuffer(2, (2, 2))
+    eb = ExpBuffer(max_timesteps=5, ll_runs=3, batch_size=2, observation_shape=(4, 4))
 
-    state = torch.tensor([[[1.0, 2.0], [3.0, 4.0]]])
-    action = torch.tensor([1], dtype=torch.int64)
-    reward = torch.tensor([1])
-    done = torch.tensor([1], dtype=torch.uint8)
-    next = torch.tensor([[[1.0, 2.0], [3.0, 4.0]]])
+    state_b = torch.ones(5, 3, 4, 4) * torch.arange(5).float().unsqueeze(1).unsqueeze(1).unsqueeze(1)
+    action_b = torch.ones(5, 3, dtype=torch.long)
+    reward_b = torch.ones(5, 3)
+    done_b = torch.ones(5, 3, dtype=torch.uint8)
+    next_b = torch.ones(5, 3, 4, 4) * torch.arange(5).float().unsqueeze(1).unsqueeze(1).unsqueeze(1)
 
-    eb.add(state, action, reward, done, next)
+    t = 0
+    eb.add(state_b[t], action_b[t], reward_b[t], done_b[t], next_b[t])
 
-    def check_state(index, state, next):
-        out_state = eb.flattener.unflatten(eb.state[index].unsqueeze(0))
-        out_next = eb.flattener.unflatten(eb.next[index].unsqueeze(0))
-        assert torch.allclose(state, out_state)
-        assert torch.allclose(next, out_next)
+    for state, action, reward, done, reset, next, index, iw in eb:
+        assert state.shape == (2, 4, 4)
+        assert action.shape == (2,)
+        assert reward.shape == (2,)
+        assert done.shape == (2,)
+        assert next.shape == (2, 4, 4)
 
-    check_state(0, state, next)
-    assert eb.done[0]
 
-    state2 = torch.rand(1, 2, 2)
-    action2 = torch.tensor([1], dtype=torch.int64)
-    reward2 = torch.tensor([1])
-    done2 = torch.tensor([0], dtype=torch.uint8)
-    next2 = torch.rand(1, 2, 2)
 
-    eb.add(state2, action2, reward2, done2, next2)
+def test_expbuffer_with_bandit():
+    eb = ExpBuffer(max_timesteps=2, ll_runs=3, batch_size=2, observation_shape=(1, 3))
+    env = gym.make('SimpleGrid-v3', n=3, device='cuda', max_steps=40, map_string="""
+        [
+        [T(-1.0), S, T(1.0)]
+        ]
+        """)
 
-    assert eb.reset[1].item() == 1
-    check_state(1, state2, next2)
+    s = env.reset()
+    for _ in range(1000):
+        action = torch.randint(4, (3,)).cuda()
+        n, reward, done, info = env.step(action)
+        eb.add(s, action, reward, done, n)
 
-    state2 = torch.rand(1, 2, 2)
-    action2 = torch.tensor([1], dtype=torch.int64)
-    reward2 = torch.tensor([1])
-    done2 = torch.tensor([1], dtype=torch.uint8)
-    next2 = torch.rand(1, 2, 2)
+        term = torch.sum(n * torch.tensor([1.0, 0.0, 1.0]).cuda(), dim=[1, 2])
+        assert torch.allclose(term, done.float())
 
-    eb.add(state2, action2, reward2, done2, next2)
+        for state, action, reward, done, reset, next, index, iw in eb:
+            b = index.size(0)
+            print(state, next, done, reset)
+            assert state.shape == (b, 1, 3)
+            assert action.shape == (b,)
+            assert reward.shape == (b,)
+            assert done.shape == (b,)
+            assert next.shape == (b, 1, 3)
+            term = torch.sum(state * torch.tensor([1.0, 0.0, 1.0]), dim=[1, 2])
+            assert torch.allclose(term, torch.zeros_like(term))
 
-    assert eb.reset[0].item() == 0
-    check_state(0, state2, next2)
-
-    state2 = torch.rand(1, 2, 2)
-    action2 = torch.tensor([1], dtype=torch.int64)
-    reward2 = torch.tensor([1])
-    done2 = torch.tensor([0], dtype=torch.uint8)
-    next2 = torch.rand(1, 2, 2)
-
-    eb.add(state2, action2, reward2, done2, next2)
-
-    assert eb.reset[1].item() == 1
-    check_state(1, state2, next2)
-
+        s = n.clone()
 
 def test_flattener():
     flattener = Flattener((20, 20), (15,))
@@ -150,7 +151,8 @@ def test_many_to_state():
 
 
 def test_prioritized_replay():
-    eb = PrioritizedExpBuffer(4, (2, 2))
+    batch_size = 2
+    eb = PrioritizedExpBuffer(4, batch_size, True, (2, 2))
 
     state = torch.tensor([[[1.0, 2.0], [3.0, 4.0]]])
     action = torch.tensor([1], dtype=torch.int64)
@@ -160,8 +162,8 @@ def test_prioritized_replay():
 
     eb.add(state, action, reward, done, next)
 
-    loader = SARSGridPrioritizedTensorDataLoader(eb, 2)
-    for state, action, reward, done, reset, next, index in loader:
+    #loader = SARSGridPrioritizedTensorDataLoader(eb, 2)
+    for state, action, reward, done, reset, next, index in eb:
         assert torch.allclose(index, torch.tensor([1, 0, 0, 0], dtype=torch.uint8))
         error = torch.tensor([0.0]).cuda()
         eb.update_td_error(index, error)
@@ -205,21 +207,20 @@ def test_prioritized_replay():
 
 
 def test_prioritized_large():
-    eb = PrioritizedExpBuffer(1000, (1,))
+    eb = PrioritizedExpBuffer(1000, 10 * 32, True, (1,))
 
     def transition(num, size):
         state = torch.tensor([[num]]*size).float()
         action = torch.tensor([num]*size, dtype=torch.int64)
         reward = torch.tensor([num]*size).float()
-        done = torch.tensor([num]*size, dtype=torch.uint8)
+        done = torch.tensor([0]*size, dtype=torch.uint8)
         next = torch.tensor([[num]]*size).float()
         return state, action, reward, done, next
 
     def step(expected_size):
         eb.add(*transition(1, 10))
 
-        loader = SARSGridPrioritizedTensorDataLoader(eb, batch_size=10 * 32)
-        for state, action, reward, done, reset, next, index in loader:
+        for state, action, reward, done, reset, next, index, i_s in eb:
             error = torch.rand(index.sum()).cuda()
             eb.update_td_error(index, error)
             print(action.size(0), expected_size)

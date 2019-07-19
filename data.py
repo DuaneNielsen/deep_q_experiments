@@ -144,10 +144,11 @@ class Flattener:
             self.length += np.prod(list(shape)).item()
 
     def flatten(self, *args):
-        flat = []
-        for tensor in args:
-            flat.append(torch.flatten(tensor, start_dim=1))
-        return torch.cat(flat, dim=1)
+        with torch.no_grad():
+            flat = []
+            for tensor in args:
+                flat.append(torch.flatten(tensor, start_dim=2))
+            return torch.cat(flat, dim=1)
 
     def unflatten(self, data):
         tensors = []
@@ -167,91 +168,105 @@ class Flattener:
 
 
 class ExpBuffer:
-    def __init__(self, sliding_window_size, *observation_shapes):
-        self.flattener = Flattener(*observation_shapes)
+    def __init__(self, max_timesteps, ll_runs, batch_size, observation_shape):
 
+        self.observation_shape = observation_shape
         self.cursor = 0
         requires_grad = False
-        self.window_size = sliding_window_size
-        self.state = torch.empty(sliding_window_size, self.flattener.length, dtype=torch.float32, requires_grad=requires_grad,
+        self.window_size = max_timesteps * ll_runs
+        self.ll_runs = ll_runs
+        self.max_timesteps = max_timesteps
+        self.state = torch.empty(max_timesteps, ll_runs, *observation_shape, dtype=torch.float32,
+                                 requires_grad=requires_grad,
                                  device='cpu')
-        self.action = torch.empty(sliding_window_size, dtype=torch.long, device='cpu')
-        self.reward = torch.empty(sliding_window_size, dtype=torch.float32, requires_grad=requires_grad, device='cpu')
-        self.done = torch.empty(sliding_window_size, dtype=torch.uint8, device='cpu')
-        self.reset = torch.zeros(sliding_window_size, dtype=torch.uint8, device='cpu')
-        self.next = torch.empty(sliding_window_size, self.flattener.length, dtype=torch.float32, requires_grad=requires_grad,
+        self.action = torch.empty(max_timesteps, ll_runs, dtype=torch.long, device='cpu')
+        self.reward = torch.empty(max_timesteps, ll_runs, dtype=torch.float32, requires_grad=requires_grad,
+                                  device='cpu')
+        self.done = torch.zeros(max_timesteps, ll_runs, dtype=torch.uint8, device='cpu')
+        self.reset = torch.zeros(max_timesteps, ll_runs, dtype=torch.uint8, device='cpu')
+        self.next = torch.empty(max_timesteps, ll_runs, *observation_shape, dtype=torch.float32,
+                                requires_grad=requires_grad,
                                 device='cpu')
+        self.reset_buffer = torch.zeros(ll_runs, dtype=torch.uint8, device='cpu')
         self.full = False
-
-    def index(self, cursor, size):
-        if cursor + size <= self.window_size:
-            index = torch.arange(cursor, cursor + size)
-        else:
-            i1 = torch.arange(cursor, self.window_size)
-            i2 = torch.arange(0, (cursor + size) % self.window_size)
-            index = torch.cat((i1, i2))
-        return index
+        self.batch_size = batch_size
 
     def add(self, state, action, reward, done, next):
+        with torch.no_grad():
+            self.state[self.cursor] = state.cpu()
+            self.next[self.cursor] = next.cpu()
+            self.action[self.cursor] = action.cpu()
+            self.reward[self.cursor] = reward.cpu()
+            done = done.cpu()
+            self.done[self.cursor] = done
 
-        size = state.size(0)
-        index = self.index(self.cursor, size)
-        reset = self.index(self.cursor + 1, size)
+            # save the done flag into buffer, use it to flag next T -> S transitions (resets)
+            self.reset[self.cursor] = self.reset_buffer
+            self.reset_buffer = done
 
-        state = self.flattener.flatten(state)
-        next = self.flattener.flatten(next)
-
-        self.state[index] = state[:].cpu()
-        self.action[index] = action[:].cpu()
-        self.reward[index] = reward[:].cpu()
-        done = done.cpu()
-        self.done[index] = done[:]
-        self.reset[reset] = done[:]
-        self.next[index] = next[:].cpu()
-
-        self.cursor += size
-        if not self.full:
-            self.full = self.cursor >= self.window_size
-        self.cursor = self.cursor % self.window_size
+            self.cursor += 1
+            if not self.full:
+                self.full = self.cursor >= self.max_timesteps
+            self.cursor = self.cursor % self.max_timesteps
 
     def update_td_error(self, index, td_error):
         pass
-
-    def dataset(self):
-        return TensorDataset(self.state, self.action, self.reward, self.done, self.reset, self.next)
 
     def __len__(self):
         if self.full:
             return self.window_size
         else:
-            return self.cursor
+            return self.cursor * self.ll_runs
 
     def clear(self):
         self.full = False
         self.cursor = 0
+
+    def data(self):
+        state = self.state.reshape(self.window_size, *self.observation_shape)
+        action = self.action.reshape(self.window_size)
+        reward = self.reward.reshape(self.window_size)
+        done = self.done.reshape(self.window_size)
+        reset = self.reset.reshape(self.window_size)
+        next = self.state.reshape(self.window_size, *self.observation_shape)
+        return state, action, reward, done, reset, next
+
+    def __iter__(self):
+        return SARSGridTensorDataLoader(self, batch_size=self.batch_size)
 
 
 class SARSGridTensorDataLoader:
     def __init__(self, exp_buffer, batch_size):
         self.exp_buffer = exp_buffer
         self.batch_size = batch_size
+        self.n = 0
+        self.state, self.action, self.reward, self.done, self.reset, self.next = exp_buffer.data()
 
     def __iter__(self):
         return self
 
     def __next__(self):
-        sample = np.random.randint(len(self.exp_buffer), size=self.batch_size)
+        if self.n * self.batch_size > len(self.exp_buffer):
+            raise StopIteration()
+        self.n += 1
+        sample = np.random.randint(len(self.exp_buffer), None, size=self.batch_size)
         index = torch.from_numpy(sample)
-        return self.exp_buffer.state[index], self.exp_buffer.action[index], self.exp_buffer.reward[index], \
-               self.exp_buffer.done[index], self.exp_buffer.reset[index], self.exp_buffer.next[index], None
+        index = index[~self.reset[index]]
+        if torch.sum(torch.tensor([1.0, 0.0, 1.0]).expand(self.batch_size, 3) * self.state[index]) != 0:
+            print(self.state[index])
+
+        return self.state[index], self.action[index], self.reward[index], \
+               self.done[index], self.reset[index], self.next[index], index, torch.ones_like(index, dtype=torch.float32,
+                                                                                            device='cpu')
 
 
 class SARSGridPrioritizedTensorDataLoader:
-    def __init__(self, exp_buffer, batch_size, correct_batch_size=False):
+    def __init__(self, exp_buffer, batch_size, importance_sample=False, correct_batch_size=False):
         self.exp_buffer = exp_buffer
         self.batch_size = batch_size
         self.n = 0
         self.correct_batch_size = correct_batch_size
+        self.importance_sample = importance_sample
 
     def __iter__(self):
         return self
@@ -286,32 +301,50 @@ class SARSGridPrioritizedTensorDataLoader:
             r = torch.rand_like(self.exp_buffer.td_error)
             index = r < w
 
-            # add back in the new samples
+            if self.importance_sample:
+                # weighted importance sampling
+                N = torch.sum(index).item() + torch.sum(new).item()
+                iw = torch.zeros_like(self.exp_buffer.td_error, device='cuda')
+                iw[index] = w[index].reciprocal() / N
+                iw[new] = 1.0 / N
+
+            # add back in the new samples and remove resets from the batch
             index = index | new
             index = ~self.exp_buffer.reset.cuda() & index
 
+            if self.importance_sample:
+                # normalize importance weights
+                iw[index] = iw[index] * iw[index].max().reciprocal()
+            else:
+                iw = torch.ones(index.size(0), dtype=torch.float32, device='cuda')
+
             index = index.cpu()
             return self.exp_buffer.state[index], self.exp_buffer.action[index], self.exp_buffer.reward[index], \
-                   self.exp_buffer.done[index], self.exp_buffer.reset[index], self.exp_buffer.next[index], index
+                   self.exp_buffer.done[index], self.exp_buffer.reset[index], self.exp_buffer.next[index], index, iw[
+                       index]
 
 
 class PrioritizedExpBuffer:
-    def __init__(self, sliding_window_size, *observation_shapes):
+    def __init__(self, sliding_window_size, batch_size, importance_sample, *observation_shapes):
         self.flattener = Flattener(*observation_shapes)
 
         self.cursor = 0
         requires_grad = False
         self.window_size = sliding_window_size
-        self.state = torch.empty(sliding_window_size, self.flattener.length, dtype=torch.float32, requires_grad=requires_grad,
+        self.state = torch.empty(sliding_window_size, self.flattener.length, dtype=torch.float32,
+                                 requires_grad=requires_grad,
                                  device='cpu')
         self.action = torch.empty(sliding_window_size, dtype=torch.long, device='cpu')
         self.reward = torch.empty(sliding_window_size, dtype=torch.float32, requires_grad=requires_grad, device='cpu')
         self.done = torch.empty(sliding_window_size, dtype=torch.uint8, device='cpu')
         self.reset = torch.zeros(sliding_window_size, dtype=torch.uint8, device='cpu')
-        self.next = torch.empty(sliding_window_size, self.flattener.length, dtype=torch.float32, requires_grad=requires_grad,
+        self.next = torch.empty(sliding_window_size, self.flattener.length, dtype=torch.float32,
+                                requires_grad=requires_grad,
                                 device='cpu')
         self.td_error = torch.ones(sliding_window_size, dtype=torch.float32, device='cuda', requires_grad=False) * -1.0
         self.full = False
+        self.batch_size = batch_size
+        self.importance_sample = importance_sample
 
     def index(self, cursor, size):
         if cursor + size <= self.window_size:
@@ -362,3 +395,7 @@ class PrioritizedExpBuffer:
         self.td_error.fill_(-1.0)
         self.full = False
         self.cursor = 0
+
+    def __iter__(self):
+        return SARSGridPrioritizedTensorDataLoader(self, batch_size=self.batch_size,
+                                                   importance_sample=self.importance_sample)

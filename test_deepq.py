@@ -1,24 +1,15 @@
-import gym
-import numpy as np
-from statistics import mean
+from train import *
+import torch
 import logging
+import gym
 import gym_duane
 
-from data import *
-from models import *
-from colorama import Style, Fore
-from collections import deque
-
-from train import batch_episode, one_step, train, train_one, train_one_curiosity
-from util import Timer, RunningReward
-from tensorboardX import SummaryWriter
-import random
-import torch
-import math
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(format='%(levelname)s-%(module)s-%(message)s', level=logging.DEBUG)
-timer = Timer()
+
+import os
+os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
 
 
 def test_reset():
@@ -78,14 +69,17 @@ def test_bandit():
         policy, critic = train(episode, critic, device, optim, actions=2, epsilon=0.05, logging_freq=0)
 
 
-def test_bandit_deepq():
-    device = 'cuda'
-    ll_runs = 1000
-    env = gym.make('SimpleGrid-v2', n=ll_runs, device=device, map_string="""
+bandit = """
     [
     [T(-1.0), S, T(1.0)]
     ]
-    """)
+    """
+
+
+def test_bandit_deepq():
+    device = 'cuda'
+    ll_runs = 1000
+    env = gym.make('SimpleGrid-v2', n=ll_runs, device=device, map_string=bandit)
 
     critic = DiscreteQTable((env.height, env.width), 2).to(device)
     critic.weights.data[0, 0, 1] = 1.0
@@ -108,6 +102,27 @@ def test_bandit_deepq():
             exp_buffer.pop(0)
 
         print_qvalues(critic.weights.data)
+
+
+def test_bandit_td_value():
+    for i in range(10):
+        ll_runs = 1000
+        steps = 20
+        ep_s = ConstantEps(0.05)
+        replay_window = ll_runs * steps // 10
+        device = 'cuda'
+        actions = 4
+        env = gym.make('SimpleGrid-v3', n=ll_runs, device=device, map_string=bandit, max_steps=40)
+        critic = DiscreteVTable((env.height, env.width)).to(device)
+        policy = VPolicy(critic, actions, EpsilonGreedyProperDiscreteDist, epsilon=1.0).to(device)
+        batch_size = 16 * ll_runs
+        exp_buffer = ExpBuffer(replay_window, batch_size, *env.observation_space_shape)
+
+        run_value_on(env=env, critic=critic, policy=policy,
+                     ll_runs=ll_runs, eps_sched=ep_s,
+                     exp_buffer=exp_buffer, batch_size=batch_size,
+                     workers=1, discount=0.8,
+                     steps=steps, logging_freq=100, run_id=f'bandit_value{i}', warmup=1000)
 
 
 def test_shortwalk_deepq():
@@ -149,160 +164,6 @@ def test_shortwalk_deepq():
         print_qvalues(critic.weights.data)
 
 
-class EpsSchedule:
-    def __init__(self, warmup_len=10000, finish=50000):
-        kickoff = np.linspace(1.0, 0.1, warmup_len)
-        finish = np.linspace(0.1, 0.01, finish)
-        self.schedule = np.concatenate((kickoff, finish), axis=0)
-
-    def epsilon_schedule(self, step):
-        if step < len(self.schedule):
-            return self.schedule[step]
-        else:
-            return 0.01
-
-
-class ExpExponentialDecay:
-    def __init__(self, half_life, minimum, steps):
-        self.x = np.linspace(0.0, steps, steps)
-        lmda = half_life / math.log(2)
-        self.x = (1.0 - minimum) * np.exp(-self.x / lmda) + minimum
-
-    def epsilon_schedule(self, step):
-        return self.x[step]
-
-
-def run_deep_q_on(env, ll_runs, critic, policy, exp_buffer, eps_sched=None, batch_size=10000, workers=12,
-                  logging_freq=10, join=OneObsToState(),
-                  run_id='default', lr=0.05, steps=12000, warmup=500, actions=4, discount=0.99):
-    # parameters
-    device = 'cuda'
-
-    state = env.reset()
-
-    # setup model
-    optim = torch.optim.SGD(critic.parameters(), lr=lr)
-
-    # monitoring
-    rw = RunningReward(ll_runs)
-    rec_reward = RunningReward(ll_runs)
-    t = SummaryWriter(f'runs/{run_id}_{random.randint(0, 10000)}')
-
-    # warmup to avoid correlations
-    for i in range(warmup):
-
-        if i % logging_freq == 0:
-            timer.start('warmup_loop')
-            logger.info(f"{Fore.LIGHTBLUE_EX}exp buffer: {len(exp_buffer)}{Style.RESET_ALL}")
-
-        state, reward, done = one_step(env, state, policy, join, exp_buffer, render=i % logging_freq == 0)
-
-        if i % logging_freq == 0:
-            timer.elapsed('warmup_loop')
-
-    exp_buffer.clear()
-
-    for i in range(steps):
-
-        if i % logging_freq == 0:
-            timer.start('main_loop')
-            logger.info(f"{Fore.LIGHTBLUE_EX}exp buffer: {len(exp_buffer)}{Style.RESET_ALL}")
-            timer.start('step')
-
-        state, reward, done = one_step(env, state, policy, join, exp_buffer, render=i % logging_freq == 0)
-
-        if i % logging_freq == 0:
-            timer.elapsed('step')
-
-        r = reward.cpu().numpy()
-        d = done.cpu().numpy()
-        rw.add(r, d)
-        rec_reward.add(r, d)
-        t.add_scalar('reward', rec_reward.reward, i)
-        t.add_scalar('episode_length', rec_reward.episode_length, i)
-        rec_reward.reset()
-
-        if i % logging_freq == 0:
-            rw.log()
-            rw.reset()
-            timer.start('train_one')
-
-        epsilon = eps_sched.epsilon_schedule(i)
-        t.add_scalar('epsilon', epsilon, i)
-
-        policy, critic = train_one(exp_buffer, critic, join, device, optim, actions=actions, epsilon=epsilon,
-                                   batch_size=batch_size, logging_freq=0, num_workers=workers, discount_factor=discount)
-
-        if i % logging_freq == 0:
-            timer.elapsed('train_one')
-            timer.elapsed('main_loop')
-            print_qvalues(critic.weights.data)
-
-
-def run_deep_q_with_curios_on(map, ll_runs, replay_window=1000, epsilon=0.06, batch_size=10000, workers=12,
-                              logging_freq=10, run_id='default', lr=0.05, curio_lr=0.05, steps=12000):
-    device = 'cuda'
-    actions = 4
-    env = gym.make('SimpleGrid-v2', n=ll_runs, device=device, map_string=map)
-
-    critic = DiscreteQTable((env.height, env.width), actions).to(device)
-    target = DiscreteQTable((env.height, env.width), actions).to(device)
-    learner = DiscreteQTable((env.height, env.width), actions).to(device)
-    optim = torch.optim.SGD(critic.parameters(), lr=lr)
-    optim_learner = torch.optim.SGD(learner.parameters(), lr=curio_lr)
-    policy = QPolicy(critic, actions, EpsilonGreedyProperDiscreteDist, epsilon=epsilon).to(device)
-    rw = RunningReward(ll_runs)
-    ave_reward = 0
-    exp_buffer = deque(maxlen=replay_window)
-
-    t = SummaryWriter(f'runs/{run_id}_{random.randint(0, 10000)}')
-
-    state = env.reset()
-
-    for i in range(steps):
-
-        if i % logging_freq == 0:
-            logger.info(f"{Fore.LIGHTBLUE_EX}exp buffer: {len(exp_buffer)}{Style.RESET_ALL}")
-            timer.start('main_loop')
-            timer.start('step')
-        state, reward, done = one_step(env, state, policy, exp_buffer, render=i % logging_freq == 0)
-
-        if i % logging_freq == 0:
-            timer.elapsed('step')
-
-        r = reward.cpu().numpy()
-        d = done.cpu().numpy()
-        rw.add(r, d)
-        t.add_scalar('reward', r.mean().item(), i)
-        t.add_scalar('done', d.sum().item(), i)
-        t.add_scalar('episode_length', rw.episode_length, i)
-
-        if i % logging_freq == 0:
-            rw.log()
-            rw.reset()
-
-            timer.start('train_one')
-        policy, critic = train_one_curiosity(exp_buffer, critic, target, learner, device, optim, optim_learner,
-                                             actions=actions, epsilon=epsilon,
-                                             batch_size=batch_size, logging_freq=0, num_workers=workers)
-        if i % logging_freq == 0:
-            timer.elapsed('train_one')
-            print_qvalues(critic.weights.data)
-            timer.elapsed('main_loop')
-
-
-def print_qvalues(weights):
-    ms = torch.argmax(weights, dim=0)
-    arrows = [u'\N{BLACK LEFT-POINTING TRIANGLE}', u'\N{BLACK RIGHT-POINTING TRIANGLE}',
-              u'\N{BLACK UP-POINTING TRIANGLE}', u'\N{BLACK DOWN-POINTING TRIANGLE}']
-
-    for i in range(ms.size(0)):
-        s = ''
-        for j in range(ms.size(1)):
-            s = s + arrows[ms[i, j].item()]
-        logger.info(s)
-
-
 frozen_lake = """
 [
 [T, T, T, T, T],
@@ -319,15 +180,15 @@ def test_frozenlake_baseline():
     for i in range(10):
         ll_runs = 600
         steps = 20000
-        ep_s = ExpExponentialDecay(steps // 10, 0.05, steps)
+        ep_s = ExpExponentialDecay(steps // 10, 0.95, 0.05, steps)
         replay_window = ll_runs * steps // 10
         device = 'cuda'
         actions = 4
-        env = gym.make('SimpleGrid-v2', n=ll_runs, device=device, map_string=frozen_lake)
+        env = gym.make('SimpleGrid-v3', n=ll_runs, device=device, map_string=frozen_lake, max_steps=40)
         critic = DiscreteQTable((env.height, env.width), actions).to(device)
         policy = QPolicy(critic, actions, EpsilonGreedyProperDiscreteDist, epsilon=1.0).to(device)
-        exp_buffer = PrioritizedExpBuffer(replay_window, *env.observation_space_shape)
         batch_size = 16 * ll_runs
+        exp_buffer = ExpBuffer(replay_window, batch_size, *env.observation_space_shape)
         run_deep_q_on(env=env, critic=critic, policy=policy,
                       ll_runs=ll_runs, eps_sched=ep_s,
                       exp_buffer=exp_buffer, batch_size=batch_size,
@@ -335,27 +196,45 @@ def test_frozenlake_baseline():
                       steps=steps, logging_freq=100, run_id=f'frozenlake_baseline_{i}', warmup=1000)
 
 
-def test_frozenlake_init():
-
-    for i in range(10):
+def test_frozenlake_prioritized():
+    for i in range(5):
         ll_runs = 600
         steps = 20000
-        ep_s = ExpExponentialDecay(steps // 10, 0.05, steps)
+        ep_s = ExpExponentialDecay(steps // 10, 0.95, 0.05, steps)
         replay_window = ll_runs * steps // 10
         device = 'cuda'
         actions = 4
-        env = gym.make('SimpleGrid-v2', n=ll_runs, device=device, map_string=frozen_lake)
+        env = gym.make('SimpleGrid-v3', n=ll_runs, device=device, map_string=frozen_lake, max_steps=40)
         critic = DiscreteQTable((env.height, env.width), actions).to(device)
-        critic.weights.data.normal_()
         policy = QPolicy(critic, actions, EpsilonGreedyProperDiscreteDist, epsilon=1.0).to(device)
-        flattener = Flattener(*env.observation_space_shape)
-        exp_buffer = ExpBuffer(replay_window, flattener)
         batch_size = 16 * ll_runs
+        exp_buffer = PrioritizedExpBuffer(replay_window, batch_size, False, *env.observation_space_shape)
         run_deep_q_on(env=env, critic=critic, policy=policy,
                       ll_runs=ll_runs, eps_sched=ep_s,
                       exp_buffer=exp_buffer, batch_size=batch_size,
                       workers=1, discount=0.8,
-                      steps=steps, logging_freq=100, run_id=f'frozenlake_init_norm_{i}', warmup=1000)
+                      steps=steps, logging_freq=100, run_id=f'frozenlake_prioritized_{i}', warmup=1000)
+
+
+def test_frozenlake_importance_sampled():
+    for i in range(5):
+        ll_runs = 600
+        steps = 20000
+        ep_s = ExpExponentialDecay(steps // 10, scale=0.95, bias=0.05, steps=steps)
+        replay_window = ll_runs * steps // 10
+        device = 'cuda'
+        actions = 4
+        env = gym.make('SimpleGrid-v3', n=ll_runs, device=device, map_string=frozen_lake, max_steps=40)
+        critic = DiscreteQTable((env.height, env.width), actions).to(device)
+        policy = QPolicy(critic, actions, EpsilonGreedyProperDiscreteDist, epsilon=1.0).to(device)
+        batch_size = 16 * ll_runs
+        exp_buffer = PrioritizedExpBuffer(replay_window, batch_size, True, *env.observation_space_shape)
+        run_deep_q_on(env=env, critic=critic, policy=policy,
+                      ll_runs=ll_runs, eps_sched=ep_s,
+                      exp_buffer=exp_buffer, batch_size=batch_size,
+                      workers=1, discount=0.8,
+                      steps=steps, logging_freq=100, run_id=f'frozenlake_imp_smp_{i}', warmup=1000)
+
 
 
 puddle_jumping = """
@@ -369,14 +248,14 @@ puddle_jumping = """
 """
 
 def test_puddlejump_baseline():
-    for i in range(10):
+    for i in range(5):
         ll_runs = 600
         steps = 40000
         ep_s = ExpExponentialDecay(steps // 10, 0.05, steps)
         replay_window = ll_runs * steps // 10
         device = 'cuda'
         actions = 4
-        env = gym.make('SimpleGrid-v3', n=ll_runs, device=device, map_string=puddle_jumping)
+        env = gym.make('SimpleGrid-v3', n=ll_runs, device=device, map_string=puddle_jumping, max_steps=100)
         critic = DiscreteQTable((env.height, env.width), actions).to(device)
         policy = QPolicy(critic, actions, EpsilonGreedyProperDiscreteDist, epsilon=1.0).to(device)
         exp_buffer = ExpBuffer(replay_window, *env.observation_space_shape)
@@ -386,6 +265,47 @@ def test_puddlejump_baseline():
                       exp_buffer=exp_buffer, batch_size=batch_size,
                       workers=1, discount=0.8,
                       steps=steps, logging_freq=100, run_id=f'puddle_baseline_{i}', warmup=1000)
+
+
+
+def test_puddlejump_importance_sampled():
+    for i in range(5):
+        ll_runs = 600
+        steps = 40000
+        ep_s = ExpExponentialDecay(steps // 10, 0.05, steps)
+        replay_window = ll_runs * steps // 10
+        device = 'cuda'
+        actions = 4
+        env = gym.make('SimpleGrid-v3', n=ll_runs, device=device, map_string=puddle_jumping, max_steps=150)
+        critic = DiscreteQTable((env.height, env.width), actions).to(device)
+        policy = QPolicy(critic, actions, EpsilonGreedyProperDiscreteDist, epsilon=1.0).to(device)
+        batch_size = 32 * ll_runs
+        exp_buffer = PrioritizedExpBuffer(replay_window, batch_size, True, *env.observation_space_shape)
+        run_deep_q_on(env=env, critic=critic, policy=policy,
+                      ll_runs=ll_runs, eps_sched=ep_s,
+                      exp_buffer=exp_buffer, batch_size=batch_size,
+                      workers=1, discount=0.8,
+                      steps=steps, logging_freq=100, run_id=f'puddlejmp_imp_smp_{i}', warmup=1000)
+
+
+def test_puddlejump_importance_sampled_cos():
+    for i in range(1):
+        ll_runs = 600
+        steps = 45000
+        ep_s = Cos(1000, 0.2, bias=0.00, steps=steps)
+        replay_window = ll_runs * steps // 10
+        device = 'cuda'
+        actions = 4
+        env = gym.make('SimpleGrid-v3', n=ll_runs, device=device, map_string=puddle_jumping)
+        critic = DiscreteQTable((env.height, env.width), actions).to(device)
+        policy = QPolicy(critic, actions, EpsilonGreedyProperDiscreteDist, epsilon=1.0).to(device)
+        batch_size = 32 * ll_runs
+        exp_buffer = PrioritizedExpBuffer(replay_window, batch_size, True, *env.observation_space_shape)
+        run_deep_q_on(env=env, critic=critic, policy=policy,
+                      ll_runs=ll_runs, eps_sched=ep_s,
+                      exp_buffer=exp_buffer, batch_size=batch_size,
+                      workers=1, discount=0.8,
+                      steps=steps, logging_freq=100, run_id=f'puddlejmp_imp_smp_cos{i}', warmup=1000)
 
 
 shortjump = """
@@ -545,6 +465,26 @@ anthill = """
 [L, L, L, L, L, L, L, L, L, L, L, L, L, L, L, L, L, L, L, L]
 ]
 """
+
+
+def test_anthill_importance_sampled():
+    for i in range(10):
+        ll_runs = 600
+        steps = 40000
+        ep_s = ExpExponentialDecay(steps // 10, 0.05, steps)
+        replay_window = ll_runs * steps // 10
+        device = 'cuda'
+        actions = 4
+        env = gym.make('SimpleGrid-v2', n=ll_runs, device=device, map_string=anthill)
+        critic = DiscreteQTable((env.height, env.width), actions).to(device)
+        policy = QPolicy(critic, actions, EpsilonGreedyProperDiscreteDist, epsilon=1.0).to(device)
+        batch_size = 16 * ll_runs
+        exp_buffer = PrioritizedExpBuffer(replay_window, batch_size, True, *env.observation_space_shape)
+        run_deep_q_on(env=env, critic=critic, policy=policy,
+                      ll_runs=ll_runs, eps_sched=ep_s,
+                      exp_buffer=exp_buffer, batch_size=batch_size,
+                      workers=1, discount=0.8,
+                      steps=steps, logging_freq=100, run_id=f'anthill_imp_smp_{i}', warmup=1000)
 
 
 def test_anthill():
