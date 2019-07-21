@@ -176,7 +176,7 @@ class ExpBuffer:
         self.window_size = max_timesteps * ll_runs
         self.ll_runs = ll_runs
         self.max_timesteps = max_timesteps
-        self.state = torch.empty(max_timesteps, ll_runs, *observation_shape, dtype=torch.float32,
+        self.state = torch.empty(size=(max_timesteps, ll_runs, *observation_shape), dtype=torch.float32,
                                  requires_grad=requires_grad,
                                  device='cpu')
         self.action = torch.empty(max_timesteps, ll_runs, dtype=torch.long, device='cpu')
@@ -187,22 +187,17 @@ class ExpBuffer:
         self.next = torch.empty(max_timesteps, ll_runs, *observation_shape, dtype=torch.float32,
                                 requires_grad=requires_grad,
                                 device='cpu')
-        self.reset_buffer = torch.zeros(ll_runs, dtype=torch.uint8, device='cpu')
         self.full = False
         self.batch_size = batch_size
 
-    def add(self, state, action, reward, done, next):
+    def add(self, state, action, reward, done, reset, next):
         with torch.no_grad():
             self.state[self.cursor] = state.cpu()
             self.next[self.cursor] = next.cpu()
             self.action[self.cursor] = action.cpu()
             self.reward[self.cursor] = reward.cpu()
-            done = done.cpu()
-            self.done[self.cursor] = done
-
-            # save the done flag into buffer, use it to flag next T -> S transitions (resets)
-            self.reset[self.cursor] = self.reset_buffer
-            self.reset_buffer = done
+            self.done[self.cursor] = done.cpu()
+            self.reset[self.cursor] = reset.cpu()
 
             self.cursor += 1
             if not self.full:
@@ -228,7 +223,7 @@ class ExpBuffer:
         reward = self.reward.reshape(self.window_size)
         done = self.done.reshape(self.window_size)
         reset = self.reset.reshape(self.window_size)
-        next = self.state.reshape(self.window_size, *self.observation_shape)
+        next = self.next.reshape(self.window_size, *self.observation_shape)
         return state, action, reward, done, reset, next
 
     def __iter__(self):
@@ -236,11 +231,12 @@ class ExpBuffer:
 
 
 class SARSGridTensorDataLoader:
-    def __init__(self, exp_buffer, batch_size):
+    def __init__(self, exp_buffer, batch_size, device='cuda'):
         self.exp_buffer = exp_buffer
         self.batch_size = batch_size
         self.n = 0
         self.state, self.action, self.reward, self.done, self.reset, self.next = exp_buffer.data()
+        self.device = device
 
     def __iter__(self):
         return self
@@ -252,12 +248,15 @@ class SARSGridTensorDataLoader:
         sample = np.random.randint(len(self.exp_buffer), None, size=self.batch_size)
         index = torch.from_numpy(sample)
         index = index[~self.reset[index]]
-        if torch.sum(torch.tensor([1.0, 0.0, 1.0]).expand(self.batch_size, 3) * self.state[index]) != 0:
-            print(self.state[index])
 
-        return self.state[index], self.action[index], self.reward[index], \
-               self.done[index], self.reset[index], self.next[index], index, torch.ones_like(index, dtype=torch.float32,
-                                                                                            device='cpu')
+        state = self.state[index].to(self.device)
+        action = self.action[index].to(self.device)
+        reward = self.reward[index].to(self.device)
+        done = self.done[index].to(self.device)
+        next = self.next[index].to(self.device)
+
+        importance_weights = torch.ones_like(index, dtype=torch.float32, device=self.device)
+        return state, action, reward, done, next, index, importance_weights
 
 
 class SARSGridPrioritizedTensorDataLoader:

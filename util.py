@@ -65,10 +65,14 @@ class RunningReward:
         self.recent = deque([])
         self.epi_len = deque([])
 
-    def add(self, reward, done):
-        self.accum += reward
-        self.steps += 1
-        d = done.astype(np.bool)
+    def add(self, reward, done, reset):
+
+        reward = reward.cpu().numpy()
+        d = done.cpu().numpy().astype(np.bool)
+        reset = reset.cpu().numpy().astype(np.bool)
+
+        self.accum += reward * ~reset
+        self.steps += 1 * ~reset
         self.recent.extend(self.accum[d].tolist())
         self.epi_len.extend(self.steps[d].tolist())
         self.accum[d] = 0.0

@@ -105,24 +105,50 @@ def test_bandit_deepq():
 
 
 def test_bandit_td_value():
-    for i in range(10):
-        ll_runs = 1000
+    for i in range(1):
+        ll_runs = 5
         steps = 20
         ep_s = ConstantEps(0.05)
-        replay_window = ll_runs * steps // 10
         device = 'cuda'
-        actions = 4
-        env = gym.make('SimpleGrid-v3', n=ll_runs, device=device, map_string=bandit, max_steps=40)
+        actions = 2
+        env = gym.make('SimpleGrid-v3', n=ll_runs, device=device, map_string=bandit, max_steps=5)
         critic = DiscreteVTable((env.height, env.width)).to(device)
-        policy = VPolicy(critic, actions, EpsilonGreedyProperDiscreteDist, epsilon=1.0).to(device)
+        policy = VPolicy(critic, actions, EpsilonGreedyProperDiscreteDist, epsilon=0.05).to(device)
         batch_size = 16 * ll_runs
-        exp_buffer = ExpBuffer(replay_window, batch_size, *env.observation_space_shape)
+        exp_buffer = ExpBuffer(max_timesteps=10, ll_runs=ll_runs, batch_size=batch_size, observation_shape=env.observation_space_shape)
 
         run_value_on(env=env, critic=critic, policy=policy,
                      ll_runs=ll_runs, eps_sched=ep_s,
                      exp_buffer=exp_buffer, batch_size=batch_size,
                      workers=1, discount=0.8,
-                     steps=steps, logging_freq=100, run_id=f'bandit_value{i}', warmup=1000)
+                     steps=steps, logging_freq=1, run_id=f'bandit_value{i}', warmup=1)
+
+walker = """
+[
+[S, E, T(1.0)]
+]
+"""
+
+def test_walker_td_value():
+    for i in range(1):
+        ll_runs = 5
+        steps = 100
+        ep_s = ConstantEps(0.05)
+        device = 'cuda'
+        actions = 2
+        env = gym.make('SimpleGrid-v3', n=ll_runs, device=device, map_string=walker, max_steps=5)
+        critic = DiscreteVTable((env.height, env.width)).to(device)
+        policy = VPolicy(critic, actions, EpsilonGreedyProperDiscreteDist, epsilon=0.05).to(device)
+        batch_size = 16 * ll_runs
+        exp_buffer = ExpBuffer(max_timesteps=10, ll_runs=ll_runs, batch_size=batch_size, observation_shape=env.observation_space_shape)
+
+        run_value_on(env=env, critic=critic, policy=policy,
+                     ll_runs=ll_runs, eps_sched=ep_s,
+                     exp_buffer=exp_buffer, batch_size=batch_size,
+                     workers=1, discount=0.8,
+                     steps=steps, logging_freq=1, run_id=f'walker_value{i}', warmup=1)
+
+
 
 
 def test_shortwalk_deepq():
@@ -164,9 +190,19 @@ def test_shortwalk_deepq():
         print_qvalues(critic.weights.data)
 
 
+lawn = """
+[
+[S, E, E, E, E],
+[E, E, E, E, E],
+[E, E, E, E, E],
+[E, E, E, E, E],
+[E, E, E, E, T(1.0)]
+]
+"""
+
+
 frozen_lake = """
 [
-[T, T, T, T, T],
 [S, E, E, E, E],
 [E, E, E, E, E],
 [E, E, T, E, T],
@@ -175,24 +211,68 @@ frozen_lake = """
 ]
 """
 
+cliff_walk = """
+[
+[E, E, E, E, E],
+[E, E, E, E, E],
+[E, E, E, E, E],
+[S, E, E, E, E],
+[T, T, T, T, T(1.0)]
+]
+"""
+
+def test_frozenlake_value_baseline():
+    for i in range(5):
+        ll_runs = 600
+        steps = 10000
+        ep_s = ExpExponentialDecay(steps // 10, 0.4, 0.02, steps)
+        device = 'cuda'
+        actions = 2
+        env = gym.make('SimpleGrid-v3', n=ll_runs, device=device, map_string=frozen_lake, max_steps=40)
+        critic = DiscreteVTable((env.height, env.width)).to(device)
+        policy = VPolicy(critic, actions, EpsilonGreedyProperDiscreteDist, epsilon=0.5).to(device)
+        batch_size = 16 * ll_runs
+        exp_buffer = ExpBuffer(max_timesteps=steps//10, ll_runs=ll_runs, batch_size=batch_size, observation_shape=env.observation_space_shape)
+
+        run_on(stepper=one_step_value, learner=train_one_value, env=env, critic=critic, policy=policy,
+                     ll_runs=ll_runs, eps_sched=ep_s,
+                     exp_buffer=exp_buffer, batch_size=batch_size, discount=0.99,
+                     steps=steps, logging_freq=100, run_id=f'frozenlake_value{i}', warmup=1, lr=0.05)
+
+
+def test_cliffwalk_value_baseline():
+    for i in range(1):
+        ll_runs = 600
+        steps = 20000
+        ep_s = ExpExponentialDecay(steps // 10, 0.95, 0.05, steps)
+        device = 'cuda'
+        actions = 2
+        env = gym.make('SimpleGrid-v3', n=ll_runs, device=device, map_string=cliff_walk, max_steps=40)
+        critic = DiscreteVTable((env.height, env.width)).to(device)
+        policy = VPolicy(critic, actions, EpsilonGreedyProperDiscreteDist, epsilon=0.5).to(device)
+        batch_size = 16 * ll_runs
+        exp_buffer = ExpBuffer(max_timesteps=steps//10, ll_runs=ll_runs, batch_size=batch_size, observation_shape=env.observation_space_shape)
+
+        run_on(stepper=one_step_value, learner=train_one_value, env=env, critic=critic, policy=policy,
+                     ll_runs=ll_runs, eps_sched=ep_s, exp_buffer=exp_buffer, batch_size=batch_size, discount=0.99,
+                     steps=steps, logging_freq=100, run_id=f'cliffwalk_value{i}', warmup=1)
+
 
 def test_frozenlake_baseline():
     for i in range(10):
         ll_runs = 600
         steps = 20000
-        ep_s = ExpExponentialDecay(steps // 10, 0.95, 0.05, steps)
-        replay_window = ll_runs * steps // 10
+        ep_s = ExpExponentialDecay(steps // 10, 0.5, 0.01, steps)
         device = 'cuda'
         actions = 4
         env = gym.make('SimpleGrid-v3', n=ll_runs, device=device, map_string=frozen_lake, max_steps=40)
         critic = DiscreteQTable((env.height, env.width), actions).to(device)
         policy = QPolicy(critic, actions, EpsilonGreedyProperDiscreteDist, epsilon=1.0).to(device)
         batch_size = 16 * ll_runs
-        exp_buffer = ExpBuffer(replay_window, batch_size, *env.observation_space_shape)
-        run_deep_q_on(env=env, critic=critic, policy=policy,
+        exp_buffer = ExpBuffer(max_timesteps=steps//10, ll_runs=ll_runs, batch_size=batch_size, observation_shape=env.observation_space_shape)
+        run_on(stepper=one_step, learner=train_one, env=env, critic=critic, policy=policy,
                       ll_runs=ll_runs, eps_sched=ep_s,
-                      exp_buffer=exp_buffer, batch_size=batch_size,
-                      workers=1, discount=0.8,
+                      exp_buffer=exp_buffer, batch_size=batch_size, discount=0.8,
                       steps=steps, logging_freq=100, run_id=f'frozenlake_baseline_{i}', warmup=1000)
 
 
@@ -537,3 +617,39 @@ def test_grid_walk():
         episode, entropy, ave_reward, episodes = batch_episode(env, policy, device, max_rollout_len=4, render=False)
         logger.info(f'{Fore.GREEN}ave_reward {ave_reward} episodes {episodes} {Style.RESET_ALL}')
         policy, critic = train(episode, critic, device, optim, actions=actions, epsilon=0.05, logging_freq=0)
+
+
+v_table = torch.tensor([
+    [0.0137, 0.0122, 0.0140, 0.0185, 0.0216],
+    [0.0149, 0.0120, 0.0036, 0.0184, 0.0083],
+    [0.0178, 0.0049, 0.9256, 0.0218, 0.8017],
+    [0.0222, 0.0259, 0.0262, 0.6383, 0.5538],
+    [0.0180, 0.0096, 0.7984, 0.7097, 0.6495]], device='cuda:0')
+
+
+def test_frozenlake_value_debug():
+    for i in range(1):
+        ll_runs = 1
+        steps = 20000
+        ep_s = ExpExponentialDecay(steps // 10, 0.5, 0.05, steps)
+        device = 'cuda'
+        actions = 2
+        env = gym.make('SimpleGrid-v3', n=ll_runs, device=device, map_string=frozen_lake, max_steps=40)
+        critic = DiscreteVTable((env.height, env.width)).to(device)
+        critic.weights.data = v_table
+        policy = VPolicy(critic, actions, EpsilonGreedyProperDiscreteDist, epsilon=0.0).to(device)
+        batch_size = 16 * ll_runs
+        join = OneObsToState()
+
+        done = torch.tensor([0], dtype=torch.uint8)
+        state = env.reset()
+        env.render()
+        print("")
+        while not done.all():
+            lookahead_state, lookahead_reward, lookahead_done, info = env.lookahead()
+            action_dist = policy(join(lookahead_state), lookahead_reward, lookahead_done)
+            action = action_dist.sample()
+            n, reward, done, reset, info = env.step(action)
+            env.render()
+            print("")
+

@@ -101,24 +101,35 @@ def test_expbuffer_with_bandit():
         """)
 
     s = env.reset()
-    for _ in range(1000):
+    for _ in range(10):
         action = torch.randint(4, (3,)).cuda()
-        n, reward, done, info = env.step(action)
-        eb.add(s, action, reward, done, n)
+        n, reward, done, reset, info = env.step(action)
+        eb.add(s, action, reward, done, reset, n)
 
         term = torch.sum(n * torch.tensor([1.0, 0.0, 1.0]).cuda(), dim=[1, 2])
         assert torch.allclose(term, done.float())
+        left = torch.tensor([[1.0, 0.0, 0.0]]).cuda()
+        right = torch.tensor([[0.0, 0.0, 1.0]]).cuda()
+        left_action = (action == 0) & ~reset
+        right_action = (action == 1) & ~reset
+        assert torch.allclose(n[left_action], left)
+        assert torch.allclose(n[right_action], right)
 
-        for state, action, reward, done, reset, next, index, iw in eb:
+        for state, action, reward, done, next, index, iw in eb:
             b = index.size(0)
-            print(state, next, done, reset)
             assert state.shape == (b, 1, 3)
             assert action.shape == (b,)
             assert reward.shape == (b,)
             assert done.shape == (b,)
             assert next.shape == (b, 1, 3)
-            term = torch.sum(state * torch.tensor([1.0, 0.0, 1.0]), dim=[1, 2])
+            term = torch.sum(state * torch.tensor([1.0, 0.0, 1.0], device='cuda'), dim=[1, 2])
             assert torch.allclose(term, torch.zeros_like(term))
+            left = torch.tensor([[1.0, 0.0, 0.0]]).cuda()
+            right = torch.tensor([[0.0, 0.0, 1.0]]).cuda()
+            left_action = (action == 0)
+            right_action = (action == 1)
+            assert torch.allclose(next[left_action], left)
+            assert torch.allclose(next[right_action], right)
 
         s = n.clone()
 

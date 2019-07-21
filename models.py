@@ -146,16 +146,20 @@ class VPolicy(nn.Module):
     def parameters(self, recurse=True):
         return self.qf.parameters(recurse)
 
-    def forward(self, states):
+    def forward(self, states, rewards, done):
         """
         :param states: lookahead in N, Action, State
+        :param states: lookahead in N, rewards
+
         :return: Probability distribution over actions
         """
         b = states.size(0)
         a = states.size(1)
         obs_shape = states.shape[2:]
         states = states.view(b * a, *obs_shape)
-        values = self.vf(states)
+        rewards = rewards.view(b * a)
+        done = done.view(b * a)
+        values = self.vf(states) * (~done).float() + rewards
         values = values.view(b, a)
         probs = torch.softmax(values, dim=1)
 

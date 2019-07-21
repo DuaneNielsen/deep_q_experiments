@@ -19,183 +19,75 @@ logger = logging.getLogger(__name__)
 timer = Timer()
 
 
-def batch_episode(env, policy, device, max_rollout_len=4000, v=None, render=False, display_observation=False):
-    episode = []
-    entropy = []
-
-    state = env.reset()
-    rwa = RewardAccumulator(state.size(0), device)
-
-    if render:
-        env.render()
-
-    for _ in range(max_rollout_len):
-
-        action_dist = policy(state)
-
-        entropy.append(action_dist.entropy().mean().item())
-
-        action = action_dist.sample()
-
-        next_state, reward, done, info = env.step(action)
-
-        episode.append(BatchStep(state.cpu().numpy(), action.cpu().numpy(), reward.cpu().numpy(), done.cpu().numpy(),
-                                 next_state.cpu().numpy()))
-
-        rwa.add(reward, done)
-
-        if render:
-            env.render(mode='human')
-        if display_observation:
-            v.render(state)
-
-        state = next_state
-
-    final_entropy = mean(entropy)
-    ave_reward, episodes = rwa.ave_reward()
-    return episode, final_entropy, ave_reward, episodes
-
-
 def one_step(env, state, policy, join, exp_buffer, v=None, render=False, display_observation=False):
 
     action_dist = policy(join(state))
 
     action = action_dist.sample()
 
-    next_state, reward, done, info = env.step(action)
+    next_state, reward, done, reset, info = env.step(action)
 
-    exp_buffer.add(state, action, reward, done, next_state)
+    exp_buffer.add(state, action, reward, done, reset, next_state)
 
     if render:
         env.render(mode='human')
     if display_observation:
         v.render(state)
 
-    return next_state, reward, done
+    return next_state, reward, done, reset
 
 
 def one_step_value(env, state, policy, join, exp_buffer, v=None, render=False, display_observation=False):
 
-    lookahead_states = env.lookahead()
+    lookahead_states, lookahead_reward, lookahead_done, info = env.lookahead()
 
-    action_dist = policy(join(lookahead_states))
+    action_dist = policy(join(lookahead_states), lookahead_reward, lookahead_done)
 
     action = action_dist.sample()
 
-    next_state, reward, done, info = env.step(action)
+    next_state, reward, done, reset, info = env.step(action)
 
-    exp_buffer.add(state, action, reward, done, next_state)
+    exp_buffer.add(state, action, reward, done, reset, next_state)
 
     if render:
         env.render(mode='human')
     if display_observation:
         v.render(state)
 
-    return next_state, reward, done
-
-
-def train(episode, critic, join, device, optim, actions, discount_factor=0.99, epsilon=0.05, logging_freq=10,
-          batch_size=10000, num_workers=12):
-    dataset = SARSGridDataset(episode)
-    loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, pin_memory=True, num_workers=num_workers)
-
-    greedy_policy = QPolicy(critic, actions=actions, dist_class=GreedyDist)
-
-    for state, action, reward, done, reset, next_state in loader:
-        state = state.to(device)
-        action = action.to(device)
-        reward = reward.to(device)
-        done = done.to(device)
-        reset = reset.to(device)
-        next_state = next_state.to(device)
-
-        # remove transtions going from Terminal => Start
-        state = state[~reset]
-        action = action[~reset]
-        reward = reward[~reset]
-        done = done[~reset]
-        next_state = next_state[~reset]
-
-        # zero the boostrapped value of terminal states
-        zero_if_terminal = (~done).to(next_state.dtype)
-
-        loss = torch.tensor([100.0])
-        prev_loss = torch.tensor([101.0])
-        i = 0
-
-        while loss.item() > 0.01 and abs(loss.item() - prev_loss.item()) > 0.0001:
-            # for _ in range(1):
-            i += 1
-            prev_loss = loss
-
-            # softmax and lack of logprob will affect the calculation here!
-            next_action = greedy_policy(join(next_state)).sample().to(device)
-
-            next_value = critic(join(next_state), next_action)
-            target = reward + zero_if_terminal * discount_factor * next_value
-
-            optim.zero_grad()
-            predicted = critic(join(state), action)
-            error = (target - predicted)
-            loss = torch.mean(error ** 2)
-            loss.backward()
-            optim.step()
-
-            if logging_freq > 0 and i % logging_freq == 0:
-                log_stats(action, critic, dataset, i, loss, predicted, state, target)
-
-        if logging_freq > 0:
-            log_stats(action, critic, dataset, i, loss, predicted, state, target)
-        logger.info(f'iterations {i}')
-    # return an epsilon greedy policy as actor
-    return QPolicy(critic, actions=actions, dist_class=EpsilonGreedyProperDiscreteDist, epsilon=epsilon), critic
+    return next_state, reward, done, reset
 
 
 def train_one(exp_buffer, critic, join, device, optim, actions, discount_factor=0.99, epsilon=0.05, logging_freq=10,
-              batch_size=10000, num_workers=12):
+              batch_size=10000):
 
     greedy_policy = QPolicy(critic, actions=actions, dist_class=GreedyDist)
 
     exp_buffer.batch_size = batch_size
 
-    for state, action, reward, done, reset, next_state, index, i_w in exp_buffer:
+    for state, action, reward, done, next_state, index, i_w in exp_buffer:
 
-        state = state.to(device)
-        action = action.to(device)
-        reward = reward.to(device)
-        done = done.to(device)
-        reset = reset.to(device)
-        next_state = next_state.to(device)
+        with torch.no_grad():
+            # zero the bootstrapped value of terminal states
+            zero_if_terminal = (~done).to(next_state.dtype)
 
-        # remove transtions going from Terminal => Start
-        state = state[~reset]
-        action = action[~reset]
-        reward = reward[~reset]
-        done = done[~reset]
-        next_state = next_state[~reset]
-        i_w = i_w[~reset]
+            # extract and convert obs to states
+            state = join(state)
+            next_state = join(next_state)
 
-        # zero the bootstrapped value of terminal states
-        zero_if_terminal = (~done).to(next_state.dtype)
+            # softmax and lack of logprob will affect the calculation here!
+            next_action = greedy_policy(join(next_state)).sample().to(device)
 
-        # extract and convert obs to states
-        state = join(exp_buffer.flattener.unflatten(state))
-        next_state = join(exp_buffer.flattener.unflatten(next_state))
-
-        # softmax and lack of logprob will affect the calculation here!
-        next_action = greedy_policy(next_state).sample().to(device)
-
-        next_value = critic(next_state, next_action)
-        target = reward + zero_if_terminal * discount_factor * next_value
+            next_value = critic(next_state, next_action)
+            target = reward + zero_if_terminal * discount_factor * next_value
 
         optim.zero_grad()
         predicted = critic(state, action)
-        error = (target - predicted) * i_w
-        loss = torch.mean(error ** 2)
+        td_error = target - predicted
+        loss = torch.mean((td_error * i_w) ** 2)
         loss.backward()
         optim.step()
 
-        exp_buffer.update_td_error(index, error)
+        exp_buffer.update_td_error(index, td_error)
 
         break
 
@@ -204,44 +96,29 @@ def train_one(exp_buffer, critic, join, device, optim, actions, discount_factor=
 
 
 def train_one_value(exp_buffer, critic, join, device, optim, actions, discount_factor=0.99, epsilon=0.05, logging_freq=10,
-              batch_size=10000, num_workers=12):
+              batch_size=10000):
 
     exp_buffer.batch_size = batch_size
 
-    for state, action, reward, done, reset, next_state, index, i_w in exp_buffer:
-
-        state = state.to(device)
-        action = action.to(device)
-        reward = reward.to(device)
-        done = done.to(device)
-        reset = reset.to(device)
-        next_state = next_state.to(device)
-
-        # remove transtions going from Terminal => Start
-        state = state[~reset]
-        action = action[~reset]
-        reward = reward[~reset]
-        done = done[~reset]
-        next_state = next_state[~reset]
-        i_w = i_w[~reset]
+    for state, action, reward, done, next_state, index, i_w in exp_buffer:
 
         # zero the bootstrapped value of terminal states
         zero_if_terminal = (~done).to(next_state.dtype)
 
         # extract and convert obs to states
-        state = join(exp_buffer.flattener.unflatten(state))
-        next_state = join(exp_buffer.flattener.unflatten(next_state))
+        state = join(state)
+        next_state = join(next_state)
 
         optim.zero_grad()
         value = critic(state)
         next_value = critic(next_state).detach()
-        target = value + discount_factor * (reward + zero_if_terminal * (next_value - value))
-        error = (target - value) * i_w
-        loss = torch.mean(error ** 2)
+        target = reward + discount_factor * next_value * zero_if_terminal
+        td_error = (target - value)
+        loss = torch.mean((td_error * i_w) ** 2)
         loss.backward()
         optim.step()
 
-        exp_buffer.update_td_error(index, error)
+        exp_buffer.update_td_error(index, td_error)
 
         break
 
@@ -360,6 +237,71 @@ class Cos:
         return self.x[step]
 
 
+def run_on(env, stepper, learner, ll_runs, critic, policy, exp_buffer, eps_sched=None, batch_size=10000, workers=12,
+                  logging_freq=10, join=OneObsToState(),
+                  run_id='default', lr=0.05, steps=12000, warmup=500, actions=4, discount=0.99):
+    # parameters
+    device = 'cuda'
+
+    state = env.reset()
+
+    # setup model
+    optim = torch.optim.SGD(critic.parameters(), lr=lr)
+
+    # monitoring
+    rw = RunningReward(ll_runs)
+    rec_reward = RunningReward(ll_runs)
+    t = SummaryWriter(f'runs/{run_id}_{random.randint(0, 10000)}')
+
+    # warmup to avoid correlations
+    for i in range(warmup):
+
+        if i % logging_freq == 0:
+            timer.start('warmup_loop')
+            logger.info(f"{Fore.LIGHTBLUE_EX}exp buffer: {len(exp_buffer)}{Style.RESET_ALL}")
+
+        state, reward, done, reset = stepper(env, state, policy, join, exp_buffer, render=i % logging_freq == 0)
+
+        if i % logging_freq == 0:
+            timer.elapsed('warmup_loop')
+
+    exp_buffer.clear()
+
+    for i in range(steps):
+
+        if i % logging_freq == 0:
+            timer.start('main_loop')
+            logger.info(f"{Fore.LIGHTBLUE_EX}exp buffer: {len(exp_buffer)}{Style.RESET_ALL}")
+            timer.start('step')
+
+        state, reward, done, reset = stepper(env, state, policy, join, exp_buffer, render=i % logging_freq == 0)
+
+        if i % logging_freq == 0:
+            timer.elapsed('step')
+
+        rw.add(reward, done, reset)
+        rec_reward.add(reward, done, reset)
+        t.add_scalar('reward', rec_reward.reward, i)
+        t.add_scalar('episode_length', rec_reward.episode_length, i)
+        rec_reward.reset()
+
+        if i % logging_freq == 0:
+            rw.log()
+            rw.reset()
+            timer.start('train_one')
+
+        epsilon = eps_sched.epsilon_schedule(i)
+        t.add_scalar('epsilon', epsilon, i)
+
+        policy, critic = learner(exp_buffer, critic, join, device, optim, actions=actions, epsilon=epsilon,
+                                   batch_size=batch_size, logging_freq=0, discount_factor=discount)
+
+        if i % logging_freq == 0:
+            timer.elapsed('train_one')
+            timer.elapsed('main_loop')
+            print(critic.weights.data)
+
+
 def run_value_on(env, ll_runs, critic, policy, exp_buffer, eps_sched=None, batch_size=10000, workers=12,
                   logging_freq=10, join=OneObsToState(),
                   run_id='default', lr=0.05, steps=12000, warmup=500, actions=4, discount=0.99):
@@ -383,7 +325,7 @@ def run_value_on(env, ll_runs, critic, policy, exp_buffer, eps_sched=None, batch
             timer.start('warmup_loop')
             logger.info(f"{Fore.LIGHTBLUE_EX}exp buffer: {len(exp_buffer)}{Style.RESET_ALL}")
 
-        state, reward, done = one_step_value(env, state, policy, join, exp_buffer, render=i % logging_freq == 0)
+        state, reward, done, reset = one_step_value(env, state, policy, join, exp_buffer, render=i % logging_freq == 0)
 
         if i % logging_freq == 0:
             timer.elapsed('warmup_loop')
@@ -397,15 +339,13 @@ def run_value_on(env, ll_runs, critic, policy, exp_buffer, eps_sched=None, batch
             logger.info(f"{Fore.LIGHTBLUE_EX}exp buffer: {len(exp_buffer)}{Style.RESET_ALL}")
             timer.start('step')
 
-        state, reward, done = one_step_value(env, state, policy, join, exp_buffer, render=i % logging_freq == 0)
+        state, reward, done, reset = one_step_value(env, state, policy, join, exp_buffer, render=i % logging_freq == 0)
 
         if i % logging_freq == 0:
             timer.elapsed('step')
 
-        r = reward.cpu().numpy()
-        d = done.cpu().numpy()
-        rw.add(r, d)
-        rec_reward.add(r, d)
+        rw.add(reward, done, reset)
+        rec_reward.add(reward, done, reset)
         t.add_scalar('reward', rec_reward.reward, i)
         t.add_scalar('episode_length', rec_reward.episode_length, i)
         rec_reward.reset()
@@ -424,7 +364,7 @@ def run_value_on(env, ll_runs, critic, policy, exp_buffer, eps_sched=None, batch
         if i % logging_freq == 0:
             timer.elapsed('train_one')
             timer.elapsed('main_loop')
-            #print_qvalues(critic.weights.data)
+            print(critic.weights.data)
 
 
 def run_deep_q_on(env, ll_runs, critic, policy, exp_buffer, eps_sched=None, batch_size=10000, workers=12,
@@ -450,7 +390,7 @@ def run_deep_q_on(env, ll_runs, critic, policy, exp_buffer, eps_sched=None, batc
             timer.start('warmup_loop')
             logger.info(f"{Fore.LIGHTBLUE_EX}exp buffer: {len(exp_buffer)}{Style.RESET_ALL}")
 
-        state, reward, done = one_step(env, state, policy, join, exp_buffer, render=i % logging_freq == 0)
+        state, reward, done, reset = one_step(env, state, policy, join, exp_buffer, render=i % logging_freq == 0)
 
         if i % logging_freq == 0:
             timer.elapsed('warmup_loop')
@@ -464,15 +404,13 @@ def run_deep_q_on(env, ll_runs, critic, policy, exp_buffer, eps_sched=None, batc
             logger.info(f"{Fore.LIGHTBLUE_EX}exp buffer: {len(exp_buffer)}{Style.RESET_ALL}")
             timer.start('step')
 
-        state, reward, done = one_step(env, state, policy, join, exp_buffer, render=i % logging_freq == 0)
+        state, reward, done, reset = one_step(env, state, policy, join, exp_buffer, render=i % logging_freq == 0)
 
         if i % logging_freq == 0:
             timer.elapsed('step')
 
-        r = reward.cpu().numpy()
-        d = done.cpu().numpy()
-        rw.add(r, d)
-        rec_reward.add(r, d)
+        rw.add(reward, done, reset)
+        rec_reward.add(reward, done, reset)
         t.add_scalar('reward', rec_reward.reward, i)
         t.add_scalar('episode_length', rec_reward.episode_length, i)
         rec_reward.reset()
