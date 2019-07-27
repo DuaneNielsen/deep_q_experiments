@@ -4,6 +4,9 @@ import torch
 from torch import tensor
 import gym
 import gym_duane
+from models import *
+from torch.distributions import Beta, Exponential, Uniform
+import matplotlib.pyplot as plt
 
 
 def test_SARSGridDataset():
@@ -71,7 +74,6 @@ def test_SARSGridDataset():
 
 
 def test_expbuffer():
-
     eb = ExpBuffer(max_timesteps=5, ll_runs=3, batch_size=2, observation_shape=(4, 4))
 
     state_b = torch.ones(5, 3, 4, 4) * torch.arange(5).float().unsqueeze(1).unsqueeze(1).unsqueeze(1)
@@ -89,7 +91,6 @@ def test_expbuffer():
         assert reward.shape == (2,)
         assert done.shape == (2,)
         assert next.shape == (2, 4, 4)
-
 
 
 def test_expbuffer_with_bandit():
@@ -133,6 +134,7 @@ def test_expbuffer_with_bandit():
 
         s = n.clone()
 
+
 def test_flattener():
     flattener = Flattener((20, 20), (15,))
 
@@ -163,51 +165,51 @@ def test_many_to_state():
 
 def test_prioritized_replay():
     batch_size = 2
-    eb = PrioritizedExpBuffer(4, batch_size, True, (2, 2))
+    eb = PrioritizedExpBuffer(4, 1, batch_size, (2, 2))
 
     state = torch.tensor([[[1.0, 2.0], [3.0, 4.0]]])
     action = torch.tensor([1], dtype=torch.int64)
     reward = torch.tensor([1])
     done = torch.tensor([1], dtype=torch.uint8)
+    reset = torch.tensor([0], dtype=torch.uint8)
     next = torch.tensor([[[1.0, 2.0], [3.0, 4.0]]])
 
-    eb.add(state, action, reward, done, next)
+    eb.add(state, action, reward, done, reset, next)
 
-    #loader = SARSGridPrioritizedTensorDataLoader(eb, 2)
-    for state, action, reward, done, reset, next, index in eb:
-        assert torch.allclose(index, torch.tensor([1, 0, 0, 0], dtype=torch.uint8))
+    for state, action, reward, done, next, index, imp in eb:
+        # assert torch.allclose(index, torch.tensor([0]))
         error = torch.tensor([0.0]).cuda()
         eb.update_td_error(index, error)
         break
 
-    state = torch.tensor([[[1.0, 2.0], [3.0, 4.0]]])
-    action = torch.tensor([1], dtype=torch.int64)
-    reward = torch.tensor([1])
-    done = torch.tensor([1], dtype=torch.uint8)
-    next = torch.tensor([[[1.0, 2.0], [3.0, 4.0]]])
-
-    eb.add(state, action, reward, done, next)
-
-    loader = SARSGridPrioritizedTensorDataLoader(eb, 2)
-    for state, action, reward, done, reset, next, index in loader:
-        assert torch.allclose(index, torch.tensor([1, 1, 0, 0], dtype=torch.uint8))
-        error = torch.tensor([0.5, 0.5]).cuda()
-        eb.update_td_error(index, error)
-        break
+    # state = torch.tensor([[[1.0, 2.0], [3.0, 4.0]]])
+    # action = torch.tensor([1], dtype=torch.int64)
+    # reward = torch.tensor([1])
+    # done = torch.tensor([1], dtype=torch.uint8)
+    # reset = torch.tensor([0], dtype=torch.uint8)
+    # next = torch.tensor([[[1.0, 2.0], [3.0, 4.0]]])
+    #
+    # eb.add(state, action, reward, done, reset, next)
+    #
+    # for state, action, reward, done, next, index, imp in eb:
+    #     #assert torch.allclose(index, torch.tensor([0, 1]))
+    #     #error = torch.tensor([0.5, 0.5]).cuda()
+    #     eb.update_td_error(index, error)
+    #     break
 
     def step():
         state = torch.tensor([[[1.0, 2.0], [3.0, 4.0]]])
         action = torch.tensor([1], dtype=torch.int64)
         reward = torch.tensor([1])
         done = torch.tensor([1], dtype=torch.uint8)
+        reset = torch.tensor([0], dtype=torch.uint8)
         next = torch.tensor([[[1.0, 2.0], [3.0, 4.0]]])
 
-        eb.add(state, action, reward, done, next)
+        eb.add(state, action, reward, done, reset, next)
 
-        loader = SARSGridPrioritizedTensorDataLoader(eb, 2)
-        for state, action, reward, done, reset, next, index in loader:
+        for state, action, reward, done, next, index, imp in eb:
             print(index)
-            error = torch.rand(index.sum()).cuda()
+            error = torch.rand(index.shape).cuda()
             eb.update_td_error(index, error)
             break
 
@@ -218,21 +220,24 @@ def test_prioritized_replay():
 
 
 def test_prioritized_large():
-    eb = PrioritizedExpBuffer(1000, 10 * 32, True, (1,))
+    t_steps = 100
+    ll_runs = 10
+    eb = PrioritizedExpBuffer(max_timesteps=t_steps, ll_runs=ll_runs, batch_size=320, observation_shape=(1,))
 
     def transition(num, size):
-        state = torch.tensor([[num]]*size).float()
-        action = torch.tensor([num]*size, dtype=torch.int64)
-        reward = torch.tensor([num]*size).float()
-        done = torch.tensor([0]*size, dtype=torch.uint8)
-        next = torch.tensor([[num]]*size).float()
-        return state, action, reward, done, next
+        state = torch.tensor([[num]] * size).float()
+        action = torch.tensor([num] * size, dtype=torch.int64)
+        reward = torch.tensor([num] * size).float()
+        done = torch.tensor([0] * size, dtype=torch.uint8)
+        reset = torch.tensor([0] * size, dtype=torch.uint8)
+        next = torch.tensor([[num]] * size).float()
+        return state, action, reward, done, reset, next
 
     def step(expected_size):
-        eb.add(*transition(1, 10))
+        eb.add(*transition(1, ll_runs))
 
-        for state, action, reward, done, reset, next, index, i_s in eb:
-            error = torch.rand(index.sum()).cuda()
+        for state, action, reward, done, next, index, imp in eb:
+            error = torch.rand(index.shape).cuda()
             eb.update_td_error(index, error)
             print(action.size(0), expected_size)
             break
@@ -242,3 +247,101 @@ def test_prioritized_large():
 
     for _ in range(100):
         step(320)
+
+
+def test_imp_sample():
+    t_steps = 1000
+    ll_runs = 100
+    eb = PrioritizedExpBuffer(max_timesteps=t_steps, ll_runs=ll_runs, batch_size=320, observation_shape=(5, 5),
+                              prioritize=False)
+    peb = PrioritizedExpBuffer(max_timesteps=t_steps, ll_runs=ll_runs, batch_size=320, observation_shape=(5, 5),
+                               importance_sample=True)
+
+    env = gym.make('SimpleGrid-v3', n=ll_runs, device='cuda', max_steps=40, map_string="""
+[
+[E, E, E, E, E],
+[E, E, E, E, E],
+[E, E, E, E, E],
+[S, E, E, E, E],
+[T, T, T, T, T(1.0)]
+]
+        """)
+
+    actions = 4
+    device = 'cuda'
+    discount_factor = 0.99
+
+    td_error_buff = Uniform(0.0, 10.0).sample(eb.td_error.shape).cuda()
+
+    def calc_td_error(state, next_state):
+        with torch.no_grad():
+            size = state.size(0)
+            #td_error = Exponential(0.98).sample((size,)).cuda()
+            td_error = Uniform(0.0, 5.0).sample((size,)).cuda()
+            return td_error
+
+    def histogram(x, title):
+        num_bins = 40
+        n, bins, patches = plt.hist(x, num_bins, facecolor='blue', alpha=0.5)
+        plt.xlabel('value')
+        plt.ylabel('number samples')
+        plt.title(title)
+        plt.legend()
+        plt.show()
+
+    s = env.reset()
+    for _ in range(100):
+        action = torch.randint(4, (ll_runs,)).cuda()
+        n, reward, done, reset, info = env.step(action)
+        eb.add(s, action, reward, done, reset, n)
+        peb.add(s, action, reward, done, reset, n)
+
+        # need to make sure all "news" are updated
+        for _ in range(200):
+            for state, action, reward, done, next_state, index, i_w in eb:
+                td_error = td_error_buff[index]
+                eb.update_td_error(index, td_error)
+                peb.update_td_error(index, td_error)
+                break
+
+    cum_ave = 0
+    cum_n = 0
+    sampled = []
+    for _ in range(20):
+        for state, action, reward, done, next_state, index, i_w in eb:
+            td_error = td_error_buff[index]
+            td_error = torch.abs(td_error)
+            sampled.append(td_error)
+            cum_sum = cum_ave * cum_n
+            batch_sum = td_error.sum()
+            cum_n = cum_n + td_error.size(0)
+            cum_ave = (cum_sum + batch_sum) / cum_n
+
+    histogram(torch.cat(sampled).cpu().numpy(), 'uniform sampling')
+    del sampled
+    print(cum_ave)
+
+    p_cum_ave = 0
+    iw_cum_ave = 0
+    cum_n = 0
+    sampled = []
+    imp_sample= []
+    for _ in range(20):
+        for state, action, reward, done, next_state, index, i_w in peb:
+            td_error = td_error_buff[index]
+            td_error = torch.abs(td_error)
+            sampled.append(td_error)
+            imp_sample.append(td_error * i_w)
+            p_cum_sum = p_cum_ave * cum_n
+            iw_cum_sum = iw_cum_ave * cum_n
+            p_batch_sum = td_error.sum()
+            iw_batch_sum = (td_error * i_w).sum()
+            cum_n = cum_n + td_error.size(0)
+            p_cum_ave = (p_cum_sum + p_batch_sum) / cum_n
+            iw_cum_ave = (iw_cum_sum + iw_batch_sum) / cum_n
+    print(p_cum_ave)
+    print(iw_cum_ave)
+    histogram(torch.cat(sampled).cpu().numpy(), 'prioritized sampling')
+    histogram(torch.cat(imp_sample).cpu().numpy(), 'importance sampling')
+    del sampled
+    del imp_sample

@@ -7,6 +7,7 @@ from multiprocessing import Process
 from collections import deque
 from torch.utils.data import TensorDataset
 from operator import mul
+import matplotlib.pyplot as plt
 
 timer = Timer()
 
@@ -241,22 +242,125 @@ class SARSGridTensorDataLoader:
     def __iter__(self):
         return self
 
-    def __next__(self):
-        if self.n * self.batch_size > len(self.exp_buffer):
-            raise StopIteration()
-        self.n += 1
-        sample = np.random.randint(len(self.exp_buffer), None, size=self.batch_size)
-        index = torch.from_numpy(sample)
-        index = index[~self.reset[index]]
-
+    def load_to_device(self, index, importance_weights):
         state = self.state[index].to(self.device)
         action = self.action[index].to(self.device)
         reward = self.reward[index].to(self.device)
         done = self.done[index].to(self.device)
         next = self.next[index].to(self.device)
-
-        importance_weights = torch.ones_like(index, dtype=torch.float32, device=self.device)
         return state, action, reward, done, next, index, importance_weights
+
+    def sample(self):
+        sample = np.random.randint(len(self.exp_buffer), None, size=self.batch_size)
+        index = torch.from_numpy(sample)
+
+        # remove resets from the batch, causes variable size batches
+        index = index[~self.reset[index]]
+        importance_weights = torch.ones_like(index, dtype=torch.float32, device=self.device)
+        return index, importance_weights
+
+    def __next__(self):
+        if self.n * self.batch_size > len(self.exp_buffer):
+            raise StopIteration()
+        self.n += 1
+
+        index, importance_weights = self.sample()
+
+        return self.load_to_device(index, importance_weights)
+
+
+class PrioritizedExpBuffer(ExpBuffer):
+    def __init__(self, max_timesteps, ll_runs, batch_size, observation_shape, importance_sample=True, prioritize=True):
+        super().__init__(max_timesteps, ll_runs, batch_size, observation_shape)
+        self.importance_sample = importance_sample
+        self.td_error = torch.zeros(max_timesteps * ll_runs, dtype=torch.float32, device='cuda', requires_grad=False)
+        self.td_error_empty = torch.ones(max_timesteps * ll_runs, dtype=torch.uint8, device='cuda', requires_grad=False)
+        self.prioritize = prioritize
+
+    def add(self, state, action, reward, done, reset, next):
+        start = self.cursor * self.ll_runs
+        end = start + self.ll_runs
+        i = torch.arange(start, end)
+        self.td_error[i] = float('Inf')
+        self.td_error_empty[i] = False
+        super().add(state, action, reward, done, reset, next)
+
+    def update_td_error(self, index, td_error):
+        with torch.no_grad():
+            self.td_error[index.cuda()] = td_error
+
+    def clear(self):
+        self.td_error.fill_(-1.0)
+        super().clear()
+
+    def __iter__(self):
+        return PrioritizedLoader(self, batch_size=self.batch_size, importance_sample=self.importance_sample,
+                                 prioritize=self.prioritize)
+
+
+def histogram(x, title):
+    num_bins = 40
+    n, bins, patches = plt.hist(x, num_bins, facecolor='blue', alpha=0.5)
+    plt.xlabel('value')
+    plt.ylabel('number samples')
+    plt.title(title)
+    plt.legend()
+    plt.show()
+
+
+class PrioritizedLoader(SARSGridTensorDataLoader):
+    def __init__(self, exp_buffer, batch_size, device='cuda', prioritize=True, importance_sample=False):
+        super().__init__(exp_buffer, batch_size, device)
+        self.importance_sample = importance_sample
+        self.prioritize = prioritize
+
+    def sample(self):
+        with torch.no_grad():
+            new = torch.isinf(self.exp_buffer.td_error)
+            empty = self.exp_buffer.td_error_empty
+            reset = self.reset.cuda()
+            new_n = torch.sum(new).item()
+            sample_size = self.batch_size - new_n
+            sample_from = ~(new | empty | reset)
+            eps = 1e-12
+            p = torch.abs(self.exp_buffer.td_error.clone()) + eps
+            sum = p[sample_from].sum()
+
+            if self.prioritize:
+                # prioritized replay sampling
+                if new_n < self.batch_size:
+                    p[sample_from] = p[sample_from] * sample_size / sum
+                    p[~sample_from] = 0.0
+                    r = torch.rand_like(p)
+                    sampled = r < p
+                    index = sampled | new
+                else:
+                    p[new] = self.batch_size / new_n
+                    p[~new] = 0.0
+                    r = torch.rand_like(p)
+                    index = r < p
+            else:
+                prob = self.batch_size / self.exp_buffer.td_error.size(0)
+                p = torch.full_like(self.exp_buffer.td_error, prob)
+                r = torch.rand_like(p)
+                index = r < p
+
+            if self.importance_sample:
+                # weighted importance sampling
+                #N = torch.sum(index).item() + torch.sum(new).item()
+                #N = index.size(0) + new.size(0)
+
+                iw = torch.ones_like(self.exp_buffer.td_error, device='cuda')
+                true_p = p[index]
+                iw[index] = true_p.mean() / true_p
+                iw[new] = 1.0
+                iw = iw[index]
+            else:
+                iw = torch.ones(index.sum().item(), device='cuda')
+
+            index = index.nonzero().flatten().cpu()
+
+            return index, iw
 
 
 class SARSGridPrioritizedTensorDataLoader:
@@ -323,7 +427,8 @@ class SARSGridPrioritizedTensorDataLoader:
                        index]
 
 
-class PrioritizedExpBuffer:
+
+class PrioritizedExpBufferOld:
     def __init__(self, sliding_window_size, batch_size, importance_sample, *observation_shapes):
         self.flattener = Flattener(*observation_shapes)
 
