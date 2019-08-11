@@ -214,6 +214,22 @@ class ExpBuffer:
         else:
             return self.cursor * self.ll_runs
 
+    def get_trajectory(self):
+        # todo this is probably innaccurate, needs more work and refinement
+        # todo probably should be using reset not done
+        trajectory = []
+        cursor = self.cursor - 1
+        while cursor >= 0:
+            state = self.state[cursor, 0]
+            reward = self.reward[cursor, 0]
+            action = self.action[cursor, 0]
+            done = self.done[cursor, 0]
+            trajectory.append(action)
+            cursor -= 1
+            if self.done[cursor, 0] == 1:
+                break
+        return list(reversed(trajectory))
+
     def clear(self):
         self.full = False
         self.cursor = 0
@@ -347,13 +363,13 @@ class PrioritizedLoader(SARSGridTensorDataLoader):
 
             if self.importance_sample:
                 # weighted importance sampling
-                #N = torch.sum(index).item() + torch.sum(new).item()
-                #N = index.size(0) + new.size(0)
+                N = sample_from.sum()
 
                 iw = torch.ones_like(self.exp_buffer.td_error, device='cuda')
                 true_p = p[index]
-                iw[index] = true_p.mean() / true_p
+                iw[index] = true_p.reciprocal() / sample_size / N
                 iw[new] = 1.0
+                iw[index] = iw[index] / iw[index].max()
                 iw = iw[index]
             else:
                 iw = torch.ones(index.sum().item(), device='cuda')

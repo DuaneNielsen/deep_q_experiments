@@ -312,14 +312,16 @@ def test_imp_sample():
             td_error = td_error_buff[index]
             td_error = torch.abs(td_error)
             sampled.append(td_error)
-            cum_sum = cum_ave * cum_n
-            batch_sum = td_error.sum()
-            cum_n = cum_n + td_error.size(0)
-            cum_ave = (cum_sum + batch_sum) / cum_n
+            # cum_sum = cum_ave * cum_n
+            # batch_sum = td_error.sum()
+            # cum_n = cum_n + td_error.size(0)
+            # cum_ave = (cum_sum + batch_sum) / cum_n
 
-    histogram(torch.cat(sampled).cpu().numpy(), 'uniform sampling')
+    tderrors = torch.cat(sampled)
+
+    histogram(tderrors.cpu().numpy(), 'uniform sampling')
     del sampled
-    print(cum_ave)
+    print(tderrors.mean().item(), tderrors.std().item())
 
     p_cum_ave = 0
     iw_cum_ave = 0
@@ -332,16 +334,45 @@ def test_imp_sample():
             td_error = torch.abs(td_error)
             sampled.append(td_error)
             imp_sample.append(td_error * i_w)
-            p_cum_sum = p_cum_ave * cum_n
-            iw_cum_sum = iw_cum_ave * cum_n
-            p_batch_sum = td_error.sum()
-            iw_batch_sum = (td_error * i_w).sum()
-            cum_n = cum_n + td_error.size(0)
-            p_cum_ave = (p_cum_sum + p_batch_sum) / cum_n
-            iw_cum_ave = (iw_cum_sum + iw_batch_sum) / cum_n
-    print(p_cum_ave)
-    print(iw_cum_ave)
-    histogram(torch.cat(sampled).cpu().numpy(), 'prioritized sampling')
-    histogram(torch.cat(imp_sample).cpu().numpy(), 'importance sampling')
-    del sampled
-    del imp_sample
+            # p_cum_sum = p_cum_ave * cum_n
+            # iw_cum_sum = iw_cum_ave * cum_n
+            # p_batch_sum = td_error.sum()
+            # iw_batch_sum = (td_error * i_w).sum()
+            # cum_n = cum_n + td_error.size(0)
+            # p_cum_ave = (p_cum_sum + p_batch_sum) / cum_n
+            # iw_cum_ave = (iw_cum_sum + iw_batch_sum) / cum_n
+
+    tderrors = torch.cat(sampled)
+    histogram(tderrors.cpu().numpy(), 'prioritized sampling')
+    print(tderrors.mean().item(), tderrors.std().item())
+
+
+    tderrors = torch.cat(imp_sample)
+    histogram(tderrors.cpu().numpy(), 'imp sampling')
+    print(tderrors.mean().item(), tderrors.std().item())
+
+
+    # print(p_cum_ave)
+    # print(iw_cum_ave)
+    # histogram(torch.cat(sampled).cpu().numpy(), 'prioritized sampling')
+    # histogram(torch.cat(imp_sample).cpu().numpy(), 'importance sampling')
+    # del sampled
+    # del imp_sample
+
+
+def test_trajectory():
+    eb = ExpBuffer(max_timesteps=200, ll_runs=3, batch_size=2, observation_shape=(1, 3))
+    env = gym.make('SimpleGrid-v3', n=3, device='cuda', max_steps=40, map_string="""
+        [
+        [T(-1.0), S, T(1.0)]
+        ]
+        """)
+
+    s = env.reset()
+    done = (False,)
+    while not done[0]:
+        action = torch.randint(4, (3,)).cuda()
+        n, reward, done, reset, info = env.step(action)
+        eb.add(s, action, reward, done, reset, n)
+
+    print(eb.get_trajectory())
