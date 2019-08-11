@@ -64,7 +64,8 @@ def test_F5_deep_q_proj():
         env = Monitor(env)
         env = BatchTensor(env, device='cuda')
 
-        critic = ProjFixupQ(obs_shape, actions, 20, 4).to(device)
+        #critic = ProjFixupQ(obs_shape, actions, 20, 4).to(device)
+        critic = EnsembleQ(obs_shape, actions, 4).to(device)
         behaviour_policy = QPolicy(critic, actions, EpsilonGreedyProperDiscreteDist).to(device)
         greedy_policy = QPolicy(critic, actions, GreedyDist).to(device)
         exp_buffer = ExpBuffer(max_timesteps=steps // 10, ll_runs=ll_runs, batch_size=batch_size,

@@ -127,7 +127,7 @@ class Q:
 
 
 class FastPlot:
-    def __init__(self, actions, device='cuda', resolution=10, fig_size=(10, 16)):
+    def __init__(self, actions, device='cuda', resolution=11, fig_size=(10, 16)):
         self.fig = plt.figure(1)
         self.fig.set_figheight(fig_size[0])
         self.fig.set_figwidth(fig_size[1])
@@ -138,7 +138,7 @@ class FastPlot:
         self.background = self.fig.canvas.copy_from_bbox(self.ax.bbox)
         self.lines = []
         self.scatter = []
-        x = np.linspace(0, 1.0, 10)
+        x = np.linspace(0, 1.0, resolution)
         y = np.zeros_like(x)
         x_s, y_s = [], []
         for a in range(actions):
@@ -150,10 +150,10 @@ class FastPlot:
 
     def update(self, critic, state, act, td_est):
         with torch.no_grad():
-            x = torch.linspace(0.0, 1.0, self.resolution, device=self.device, requires_grad=False)
+            x = torch.linspace(0.0, 1.0, self.resolution, device=self.device, requires_grad=False).unsqueeze(1)
             for a in range(self.actions):
                 self.fig.canvas.restore_region(self.background)
-                v = critic(x, torch.ones(10, dtype=torch.long, device=self.device, requires_grad=False) * a)
+                v = critic(x, torch.ones(self.resolution, dtype=torch.long, device=self.device, requires_grad=False) * a)
                 self.lines[a][0].set_ydata(v.cpu().numpy())
                 action_mask = a == act
                 self.scatter[a].set_offsets(np.c_[state[action_mask].cpu().numpy(), td_est[action_mask].cpu().numpy()])
