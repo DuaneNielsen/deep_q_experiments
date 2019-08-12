@@ -11,7 +11,7 @@ timer = Timer()
 
 
 class Q:
-    def __init__(self, env, critic, behaviour_policy, greedy_policy, exp_buffer, join=OneObsToState(), device='cuda', viewer=None, tb=None, plot=None):
+    def __init__(self, env, critic, behaviour_policy, greedy_policy, exp_buffer, join=OneObsToState(), device='cuda', viewer=None, plot=None):
         self.env = env
         self.state = self.env.reset()
         self.join = join
@@ -22,7 +22,7 @@ class Q:
         self.behavior_policy = behaviour_policy
         self.greedy_policy = greedy_policy
         self.device = device
-        self.tb = tb
+        self.tb = None
         self.plot = plot
         self.epsilon = None
 
@@ -36,7 +36,7 @@ class Q:
         optim = torch.optim.SGD(self.critic.parameters(), lr=lr)
 
         # monitoring
-        t = SummaryWriter(f'runs/{run_id}_{random.randint(0, 10000)}')
+        self.tb = SummaryWriter(f'runs/{run_id}_{random.randint(0, 10000)}')
         e_log = SingleLogger(self.exp_buffer, logging_freq, t, self.critic, self.join)
 
         for step in range(steps):
@@ -54,7 +54,6 @@ class Q:
             e_log.log_progress(state, reward, done, reset, step, self.epsilon, lr)
 
             self.train(discount_factor, batch_size, optim, step)
-
 
             critic = self.train(discount_factor, batch_size, optim, step)
 

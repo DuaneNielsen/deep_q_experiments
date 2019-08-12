@@ -2,7 +2,7 @@ import torch
 from torch import nn
 from torch.distributions import Categorical
 import numpy as np
-from torch.nn.functional import one_hot, selu
+from torch.nn.functional import one_hot, selu, relu
 
 class GreedyDist:
     def __init__(self, probs):
@@ -297,16 +297,18 @@ class ProjFixupQ(nn.Module):
 
 
 class EnsembleQ(nn.Module):
-    def __init__(self, state_shape, actions, blocks):
+    def __init__(self, state_shape, actions, hidden, blocks):
         super().__init__()
         self.state_features = np.prod(state_shape)
 
+        self.project = nn.Linear(self.state_features, hidden, bias=True)
+
         self.act_ensemble = nn.ModuleList([
-            nn.Sequential(*[FixupFCResLayer((depth * 2) + 2, self.state_features) for depth in range(blocks)])
+            nn.Sequential(*[FixupFCResLayer((depth * 2) + 2, hidden) for depth in range(blocks)])
             for _ in range(actions)
         ])
 
-        self.value = nn.Linear(self.state_features, 1)
+        self.value = nn.Linear(hidden, 1)
         self.value.weight.data.zero_()
         self.value.bias.data.zero_()
         self.gain = nn.Parameter(torch.ones(1))
@@ -314,9 +316,10 @@ class EnsembleQ(nn.Module):
         self.actions = actions
 
     def forward(self, states, actions):
+        projected = relu(self.project(states))
         hidden = []
         for i, l in enumerate(self.act_ensemble):
-            hidden.append(self.act_ensemble[i](states))
+            hidden.append(self.act_ensemble[i](projected))
         selected = torch.stack(hidden)[actions, torch.arange(states.size(0))]
         values = self.value(selected) * self.gain + self.bias
         return values.squeeze()
